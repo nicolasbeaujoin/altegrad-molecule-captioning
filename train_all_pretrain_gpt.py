@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 # from torch_scatter import scatter_softmax
 
 from torch_geometric.loader import DataLoader
@@ -12,7 +13,7 @@ from torch_geometric.utils import to_dense_adj, add_self_loops
 
 from data_utils import load_id2emb, PreprocessedGraphDataset, collate_fn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from tqdm import tqdm 
+from tqdm import tqdm
 
 
 # =========================================================
@@ -480,11 +481,13 @@ def main():
 
     # 1. Initialize Combined Model using the PRE-TRAINED encoder
     mol_enc = MolGNN(hidden=128).to(DEVICE)
-    state_dict = torch.load("checkpoints/mol_enc.pt", map_location=DEVICE)
+    state_dict = torch.load(
+        "checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE
+    )
     mol_enc.load_state_dict(state_dict)
     mol_enc.to(DEVICE)
-    
-    model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2")
+
+    model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2-medium")
     model.to(DEVICE)
     model.tokenizer.pad_token = model.tokenizer.eos_token
 
