@@ -18,7 +18,7 @@ mol_enc.load_state_dict(state_dict1)
 mol_enc.to(device)
 
 # Instantiate the model with the same configuration used during training
-model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2")
+model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2-medium")
 
 # Ensure padding token is set (as in training)
 model.tokenizer.pad_token = model.tokenizer.eos_token
@@ -32,7 +32,7 @@ model.eval()  # Set to evaluation mode (turns off dropout, etc.)
 # 2. Load Test Data
 # Note: The document states test_graphs.pkl has no descriptions [cite: 23]
 test_dataset = PreprocessedGraphDataset("data/test_graphs.pkl")
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
 predictions = []
 
@@ -59,7 +59,7 @@ with torch.no_grad():
 # 4. Create Submission File
 # Format must be a CSV with "ID" and "description" columns
 df = pd.DataFrame(predictions)
-df.to_csv("submission2.csv", index=False)
+df.to_csv("submission4.csv", index=False)
 
 print(f"Success! Generated predictions for {len(df)} molecules.")
 print("Upload 'submission.csv' to Kaggle to get your BLEU/BERTScore.")

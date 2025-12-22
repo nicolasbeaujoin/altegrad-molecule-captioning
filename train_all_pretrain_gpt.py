@@ -73,16 +73,14 @@ class GINEConv(MessagePassing):
 
 
 class MolGNN(nn.Module):
-    def __init__(self, in_dim=9, hidden=128, out_dim=256, layers=3, dropout=0.1):
+    def __init__(self, in_dim=9, hidden=128, layers=3, dropout=0.1):
         super().__init__()
         self.node_emb_layers = nn.ModuleList(
             [nn.Embedding(vocab_size, hidden) for vocab_size in NODE_VOCAB_SIZES]
         )
-
         self.edge_emb_layers = nn.ModuleList(
             [nn.Embedding(vocab_size, hidden) for vocab_size in EDGE_VOCAB_SIZES]
         )
-
         self.virtual_node_emb = nn.Embedding(1, hidden)
         nn.init.constant_(self.virtual_node_emb.weight.data, 0)
 
@@ -93,7 +91,6 @@ class MolGNN(nn.Module):
         for _ in range(layers):
             self.convs.append(GINEConv(hidden))
             self.bns.append(nn.BatchNorm1d(hidden))
-
             self.vn_mlps.append(
                 nn.Sequential(
                     nn.Linear(hidden, hidden),
@@ -108,11 +105,6 @@ class MolGNN(nn.Module):
         self.pretrain_head = nn.Sequential(
             nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, NODE_VOCAB_SIZES[0])
         )
-
-        self.projector = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, out_dim)
-        )
-
         self.dropout = nn.Dropout(dropout)
 
     def _embed_nodes(self, x):
@@ -120,7 +112,6 @@ class MolGNN(nn.Module):
         h_cat = []
         for i, emb_layer in enumerate(self.node_emb_layers):
             h_cat.append(emb_layer(x_long[:, i]))
-
         return torch.stack(h_cat, dim=0).sum(dim=0)
 
     def _embed_edges(self, edge_attr):
@@ -128,65 +119,35 @@ class MolGNN(nn.Module):
         edge_embs = []
         for i, emb_layer in enumerate(self.edge_emb_layers):
             edge_embs.append(emb_layer(edge_attr_long[:, i]))
-
         return torch.stack(edge_embs, dim=0).sum(dim=0)
 
     def _gnn_forward(self, h, edge_index, edge_emb, batch_idx):
         vn_emb = self.virtual_node_emb(
             torch.zeros(batch_idx.max() + 1, dtype=torch.long, device=h.device)
         )
-
         for conv, bn, vn_mlp in zip(self.convs, self.bns, self.vn_mlps):
             h = h + vn_emb[batch_idx]
             h_in = h
-
             h = conv(h, edge_index, edge_emb)
             h = bn(h)
             h = F.relu(h)
             h = self.dropout(h)
-
             h = h + h_in
-
             aggr_nodes = global_add_pool(h, batch_idx)
             vn_emb = vn_emb + vn_mlp(aggr_nodes)
-
         return h
-
-    def forward_align(self, batch):
-        h = self._embed_nodes(batch.x)
-        edge_emb = self._embed_edges(batch.edge_attr)
-
-        h = self._gnn_forward(h, batch.edge_index, edge_emb, batch.batch)
-
-        g = global_add_pool(h, batch.batch)
-        z = self.projector(g)
-        return F.normalize(z, dim=-1)
 
     def forward_pretrain(self, batch):
         h = self._embed_nodes(batch.x)
         edge_emb = self._embed_edges(batch.edge_attr)
-
         h = self._gnn_forward(h, batch.edge_index, edge_emb, batch.batch)
-
         logits = self.pretrain_head(h)
-
         return logits
 
-    def forward(self, batch):
-        return self.forward_align(batch)
-
     def forward_features(self, batch):
-        """
-        Returns the raw graph representation (un-normalized) for the caption decoder.
-        """
-        # 1. Embed and run GNN
         h = self._embed_nodes(batch.x)
         edge_emb = self._embed_edges(batch.edge_attr)
         h = self._gnn_forward(h, batch.edge_index, edge_emb, batch.batch)
-
-        # 2. Pool to global representation (Size: hidden=128)
-        # We skip the 'projector' here because we will build a new specific
-        # bridge for GPT-2 in the parent class.
         g = global_add_pool(h, batch.batch)
         return g
 
@@ -491,6 +452,10 @@ def main():
     model.to(DEVICE)
     model.tokenizer.pad_token = model.tokenizer.eos_token
 
+    state_dict2 = torch.load("checkpoints/g2cap_epoch_9.pt", map_location=DEVICE)
+    model.load_state_dict(state_dict2)
+    model.to(DEVICE)
+
     # 2. Optimizer (Fine-tune GNN slowly, Train Bridge/GPT normal)
     optimizer = torch.optim.AdamW(
         [
@@ -499,7 +464,7 @@ def main():
                 "lr": 1e-4,
             },  # Lower LR for pre-trained part
             {"params": model.projection.parameters(), "lr": 1e-3},
-            {"params": model.gpt2.parameters(), "lr": 5e-5},  # Very low for GPT-2
+            {"params": model.gpt2.parameters(), "lr": 5e-4},  # Very low for GPT-2: 5e-5
         ]
     )
 
@@ -562,8 +527,11 @@ def main():
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
+        print(
+            f"Epoch {epoch+1}/{EPOCHS} - Average Loss: {total_loss / len(train_loader):.4f}"
+        )
         # Save Checkpoint
-        torch.save(model.state_dict(), f"checkpoints/g2cap_epoch_{epoch}.pt")
+        torch.save(model.state_dict(), f"checkpoints/g2cap_epoch_{epoch+10}.pt")
 
 
 if __name__ == "__main__":
