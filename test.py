@@ -12,8 +12,8 @@ from train_all_pretrain_gpt import Graph2CaptionV2, MolGNN
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
-mol_enc = MolGNN(hidden=128).to(device)
-state_dict1 = torch.load("checkpoints/mol_enc.pt", map_location=device)
+mol_enc = MolGNN(hidden=512).to(device)
+state_dict1 = torch.load("checkpoints/mol_enc_best.pt", map_location=device)
 mol_enc.load_state_dict(state_dict1)
 mol_enc.to(device)
 
@@ -59,7 +59,7 @@ with torch.no_grad():
 # 4. Create Submission File
 # Format must be a CSV with "ID" and "description" columns
 df = pd.DataFrame(predictions)
-df.to_csv("submission4.csv", index=False)
+df.to_csv("submission_last.csv", index=False)
 
 print(f"Success! Generated predictions for {len(df)} molecules.")
 print("Upload 'submission.csv' to Kaggle to get your BLEU/BERTScore.")
