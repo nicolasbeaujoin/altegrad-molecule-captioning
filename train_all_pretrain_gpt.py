@@ -10,38 +10,11 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch
 from torch_geometric.nn import global_add_pool, MessagePassing
 from torch_geometric.utils import to_dense_adj, add_self_loops
+from torch_geometric.utils import to_dense_batch
 
 from data_utils import load_id2emb, PreprocessedGraphDataset, collate_fn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from tqdm import tqdm
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-# Data paths
-TRAIN_GRAPHS = "data/train_graphs.pkl"
-VAL_GRAPHS = "data/validation_graphs.pkl"
-TEST_GRAPHS = "data/test_graphs.pkl"
-
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
-VAL_EMB_CSV = "data/validation_embeddings.csv"
-
-# Model parameters
-NODE_VOCAB_SIZES = [119, 9, 11, 12, 9, 5, 8, 2, 2]
-EDGE_VOCAB_SIZES = [22, 6, 2]
-
-# Pre-Training parameters
-MASK_RATE = 0.15
-MASK_TOKEN_ID = 0
-PRETRAIN_EPOCHS = 20
-PRETRAIN_LR = 1e-3
-
-# Training parameters
-BATCH_SIZE = 32
-EPOCHS = 10
-LR = 1e-3
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # =========================================================
@@ -72,8 +45,54 @@ class GINEConv(MessagePassing):
         return self.mlp(out)
 
 
+class MultiTokenProjector(nn.Module):
+    def __init__(self, gnn_hidden=256, gpt_hidden=1024, num_tokens=8):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.gnn_hidden = gnn_hidden
+
+        # 1. Learnable queries: These tokens "extract" info from the graph
+        self.latents = nn.Parameter(torch.randn(1, num_tokens, gnn_hidden))
+
+        # 2. Cross-Attention: Latents (Query) look at Node Features (Key/Value)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=gnn_hidden, num_heads=8, batch_first=True
+        )
+
+        # 3. LayerNorm for training stability
+        self.ln_gnn = nn.LayerNorm(gnn_hidden)
+        self.ln_gpt = nn.LayerNorm(gpt_hidden)
+
+        # 4. Final projection to GPT-2 dimension (e.g., 1024) [cite: 72, 96]
+        self.proj = nn.Linear(gnn_hidden, gpt_hidden)
+
+    def forward(self, node_features, batch_index):
+        # Convert flattened PyG nodes to a dense batch [cite: 31, 32, 34]
+        # dense_nodes: [Batch, MaxNodesPerBatch, 256]
+        # mask: [Batch, MaxNodesPerBatch] (True for real nodes, False for padding)
+        dense_nodes, mask = to_dense_batch(node_features, batch_index)
+
+        # Prepare queries for the batch
+        batch_size = dense_nodes.size(0)
+        query = self.latents.expand(batch_size, -1, -1)  # [Batch, 8, 256]
+
+        # Cross-Attention:
+        # MultiheadAttention uses 'key_padding_mask' where True = MASK OUT (ignore)
+        # PyG's mask is True = KEEP. So we use ~mask.
+        attn_out, _ = self.cross_attn(
+            query=query, key=dense_nodes, value=dense_nodes, key_padding_mask=~mask
+        )
+
+        # Residual and Normalization
+        out = self.ln_gnn(attn_out + query)
+
+        # Project to GPT embedding space [cite: 72]
+        out = self.proj(out)
+        return self.ln_gpt(out)
+
+
 class MolGNN(nn.Module):
-    def __init__(self, in_dim=9, hidden=128, layers=3, dropout=0.1):
+    def __init__(self, hidden=256, layers=5, dropout=0.1):
         super().__init__()
         self.node_emb_layers = nn.ModuleList(
             [nn.Embedding(vocab_size, hidden) for vocab_size in NODE_VOCAB_SIZES]
@@ -122,19 +141,13 @@ class MolGNN(nn.Module):
         return torch.stack(edge_embs, dim=0).sum(dim=0)
 
     def _gnn_forward(self, h, edge_index, edge_emb, batch_idx):
-        vn_emb = self.virtual_node_emb(
-            torch.zeros(batch_idx.max() + 1, dtype=torch.long, device=h.device)
-        )
-        for conv, bn, vn_mlp in zip(self.convs, self.bns, self.vn_mlps):
-            h = h + vn_emb[batch_idx]
+        # vn_emb = self.virtual_node_emb(
+        #     torch.zeros(batch_idx.max() + 1, dtype=torch.long, device=h.device)
+        # )
+        for conv, bn in zip(self.convs, self.bns):
             h_in = h
-            h = conv(h, edge_index, edge_emb)
-            h = bn(h)
-            h = F.relu(h)
-            h = self.dropout(h)
-            h = h + h_in
-            aggr_nodes = global_add_pool(h, batch_idx)
-            vn_emb = vn_emb + vn_mlp(aggr_nodes)
+            h = F.relu(bn(conv(h, edge_index, edge_emb)))
+            h = self.dropout(h) + h_in  # Residual connection
         return h
 
     def forward_pretrain(self, batch):
@@ -148,75 +161,93 @@ class MolGNN(nn.Module):
         h = self._embed_nodes(batch.x)
         edge_emb = self._embed_edges(batch.edge_attr)
         h = self._gnn_forward(h, batch.edge_index, edge_emb, batch.batch)
-        g = global_add_pool(h, batch.batch)
-        return g
+        return h
 
 
 class Graph2CaptionV2(nn.Module):
-    def __init__(self, pretrained_encoder, gpt2_model_name="gpt2-medium"):
+    def __init__(
+        self, pretrained_encoder, gpt2_model_name="gpt2-medium", num_graph_tokens=8
+    ):
         super().__init__()
-
-        # 1. Use the pre-trained encoder
+        # 1. Store the upgraded GNN encoder
         self.encoder = pretrained_encoder
+        self.num_graph_tokens = num_graph_tokens
 
-        # Determine dimensions
-        # Assuming MolGNN hidden size is 128 (default in your code)
-        gnn_hidden_dim = 128
-
-        # 2. Text Decoder
+        # 2. Text Decoder Setup [cite: 96]
         self.gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_name)
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_model_name)
-        gpt_emb_size = self.gpt2.config.n_embd  # 1024 for medium
+        self.gpt2.resize_token_embeddings(len(self.tokenizer))
+        gpt_hidden_dim = self.gpt2.config.n_embd  # 1024 for medium [cite: 72, 73]
+        gnn_hidden_dim = 512  # Updated hidden size for upgraded GNN
 
-        # 3. The Bridge (CRITICAL STEP)
-        # Maps the pre-trained GNN size (128) to GPT-2 size (1024)
-        self.projection = nn.Linear(gnn_hidden_dim, gpt_emb_size)
+        # 3. Multi-Token Projector (Attention-based Bridge) [cite: 7, 14]
+        # Instead of 1 vector, this extracts 'num_graph_tokens' from the molecule
+        self.projector = MultiTokenProjector(
+            gnn_hidden=gnn_hidden_dim,
+            gpt_hidden=gpt_hidden_dim,
+            num_tokens=num_graph_tokens,
+        )
 
     def forward(self, data, text_input_ids, text_attention_mask):
-        # 1. Get raw graph features (using the new method)
-        graph_vec = self.encoder.forward_features(data)  # [batch, 128]
+        # A. Extract detailed node features (no global pooling yet) [cite: 13, 14]
+        # Shape: [TotalNodesInBatch, 256]
+        node_features = self.encoder.forward_features(data)
 
-        # 2. Project to GPT space
-        projected_emb = self.projection(graph_vec)  # [batch, 1024]
+        # B. Generate Multi-Token Graph Representation [cite: 7, 14]
+        # Shape: [Batch, num_graph_tokens, 1024]
+        graph_tokens = self.projector(node_features, data.batch)
 
-        # 3. Reshape for GPT-2: [batch, 1, 1024]
-        projected_emb = projected_emb.unsqueeze(1)
+        # C. Prepare Text Embeddings
+        text_embeds = self.gpt2.transformer.wte(text_input_ids)  # [Batch, SeqLen, 1024]
 
-        # 4. Get Text Embeddings
-        text_embeds = self.gpt2.transformer.wte(text_input_ids)
+        # D. Concatenate: [Graph_Tokens... , Text_Tokens...] [cite: 7, 14]
+        # Resulting shape: [Batch, num_graph_tokens + SeqLen, 1024]
+        inputs_embeds = torch.cat((graph_tokens, text_embeds), dim=1)
 
-        # 5. Concatenate: [Graph_Token, Text_Tokens...]
-        inputs_embeds = torch.cat((projected_emb, text_embeds), dim=1)
-
-        # 6. Extend Attention Mask
+        # E. Extend Attention Mask [cite: 86]
+        # We must add 'num_graph_tokens' ones to the mask so GPT-2 attends to the graph
         batch_size = text_attention_mask.shape[0]
-        ones = torch.ones((batch_size, 1), device=text_attention_mask.device)
-        extended_mask = torch.cat((ones, text_attention_mask), dim=1)
+        graph_mask = torch.ones(
+            (batch_size, self.num_graph_tokens), device=text_attention_mask.device
+        )
+        extended_mask = torch.cat((graph_mask, text_attention_mask), dim=1)
 
         return self.gpt2(
             inputs_embeds=inputs_embeds, attention_mask=extended_mask
         ).logits
 
     def generate_caption(self, data, max_length=100):
-        # Inference logic...
-        graph_vec = self.encoder.forward_features(data)
-        cur_input_embeds = self.projection(graph_vec).unsqueeze(1)
+        """
+        Updated inference logic to handle multiple graph tokens. [cite: 83, 84]
+        """
+        self.eval()
+        with torch.no_grad():
+            # 1. Encode Graph to tokens
+            node_features = self.encoder.forward_features(data)
+            graph_tokens = self.projector(node_features, data.batch)  # [1, 8, 1024]
 
-        generated_ids = []
-        # (Greedy loop same as before...)
-        for _ in range(max_length):
-            outputs = self.gpt2(inputs_embeds=cur_input_embeds)
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            generated_ids.append(next_token_id)
-            if next_token_id.item() == self.tokenizer.eos_token_id:
-                break
-            next_input_embeds = self.gpt2.transformer.wte(next_token_id)
-            cur_input_embeds = torch.cat((cur_input_embeds, next_input_embeds), dim=1)
+            # 2. Initialize generation
+            cur_input_embeds = graph_tokens
+            generated_ids = []
 
-        return self.tokenizer.decode(
-            [t.item() for t in generated_ids], skip_special_tokens=True
-        )
+            # Simple greedy loop (Batch Size 1 recommended for inference)
+            for _ in range(max_length):
+                outputs = self.gpt2(inputs_embeds=cur_input_embeds)
+                next_token_logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+
+                generated_ids.append(next_token_id.item())
+
+                if next_token_id.item() == self.tokenizer.eos_token_id:
+                    break
+
+                # Append predicted token embedding to current sequence
+                next_input_embeds = self.gpt2.transformer.wte(next_token_id)
+                cur_input_embeds = torch.cat(
+                    (cur_input_embeds, next_input_embeds), dim=1
+                )
+
+            return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
 # =========================================================
@@ -416,55 +447,84 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device):
 #     main()
 
 
+# =========================================================
+# CONFIG
+# =========================================================
+# Data paths
+TRAIN_GRAPHS = "data/train_graphs.pkl"
+VAL_GRAPHS = "data/validation_graphs.pkl"
+TEST_GRAPHS = "data/test_graphs.pkl"
+
+TRAIN_EMB_CSV = "data/train_embeddings.csv"
+VAL_EMB_CSV = "data/validation_embeddings.csv"
+
+# Model parameters
+NODE_VOCAB_SIZES = [119, 9, 11, 12, 9, 5, 8, 2, 2]
+EDGE_VOCAB_SIZES = [22, 6, 2]
+
+# Pre-Training parameters
+MASK_RATE = 0.15
+MASK_TOKEN_ID = 0
+PRETRAIN_EPOCHS = 20
+PRETRAIN_LR = 1e-3
+
+# Training parameters
+BATCH_SIZE = 32
+EPOCHS_PHASE_1 = 2
+EPOCHS_PHASE_2 = 10
+LR = 1e-3
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def pretrain():
+    # --- Phase 1: Pre-Training (Masking) ---
+    print("\n=== Phase 1: Pre-Training GNN ===")
+
+    # Initialize basic GNN (hidden=512)
+    mol_enc = MolGNN(hidden=512).to(DEVICE)
+
+    # Load data for pre-training (We only need graphs, not text yet)
+    # Note: Pass 'None' for embeddings if you don't use them in pre-training
+    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, None)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+
+    pretrain_optimizer = torch.optim.Adam(mol_enc.parameters(), lr=PRETRAIN_LR)
+
+    for ep in range(PRETRAIN_EPOCHS):
+        loss = train_epoch_pretrain(mol_enc, train_dl, pretrain_optimizer, DEVICE)
+        print(f"Pretrain Epoch {ep+1}: {loss:.4f}")
+
+    print("Pre-training complete. Saving GNN weights.")
+    torch.save(mol_enc.state_dict(), "checkpoints/mol_enc_best.pt")
+
+
 def main():
-    # # --- Phase 1: Pre-Training (Masking) ---
-    # print("\n=== Phase 1: Pre-Training GNN ===")
-
-    # # Initialize basic GNN (hidden=128)
-    # mol_enc = MolGNN(hidden=128).to(DEVICE)
-
-    # # Load data for pre-training (We only need graphs, not text yet)
-    # # Note: Pass 'None' for embeddings if you don't use them in pre-training
-    # train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, None)
-    # train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-
-    # pretrain_optimizer = torch.optim.Adam(mol_enc.parameters(), lr=PRETRAIN_LR)
-
-    # for ep in range(PRETRAIN_EPOCHS):
-    #     loss = train_epoch_pretrain(mol_enc, train_dl, pretrain_optimizer, DEVICE)
-    #     print(f"Pretrain Epoch {ep+1}: {loss:.4f}")
-
-    # print("Pre-training complete. Saving GNN weights.")
-    # torch.save(mol_enc.state_dict(), "checkpoints/mol_enc.pt")
-
     # --- Phase 2: Captioning Fine-Tuning ---
     print("\n=== Phase 2: Training Graph2Caption ===")
 
     # 1. Initialize Combined Model using the PRE-TRAINED encoder
-    mol_enc = MolGNN(hidden=128).to(DEVICE)
-    state_dict = torch.load(
-        "checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE
-    )
+    mol_enc = MolGNN(hidden=512).to(DEVICE)
+    state_dict = torch.load("checkpoints/mol_enc_best.pt", map_location=DEVICE)
     mol_enc.load_state_dict(state_dict)
     mol_enc.to(DEVICE)
 
-    model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2-medium")
+    model = Graph2CaptionV2(
+        pretrained_encoder=mol_enc, gpt2_model_name="gpt2-medium", num_graph_tokens=8
+    )
     model.to(DEVICE)
     model.tokenizer.pad_token = model.tokenizer.eos_token
 
-    state_dict2 = torch.load("checkpoints/g2cap_epoch_9.pt", map_location=DEVICE)
-    model.load_state_dict(state_dict2)
-    model.to(DEVICE)
+    # state_dict2 = torch.load("checkpoints/g2cap_epoch_9.pt", map_location=DEVICE)
+    # model.load_state_dict(state_dict2)
+    # model.to(DEVICE)
 
-    # 2. Optimizer (Fine-tune GNN slowly, Train Bridge/GPT normal)
-    optimizer = torch.optim.AdamW(
+    for param in model.gpt2.parameters():
+        param.requires_grad = False
+
+    optimizer_phase1 = torch.optim.AdamW(
         [
-            {
-                "params": model.encoder.parameters(),
-                "lr": 1e-4,
-            },  # Lower LR for pre-trained part
-            {"params": model.projection.parameters(), "lr": 1e-3},
-            {"params": model.gpt2.parameters(), "lr": 5e-4},  # Very low for GPT-2: 5e-5
+            {"params": model.encoder.parameters(), "lr": 1e-4},
+            {"params": model.projector.parameters(), "lr": 1e-3},
         ]
     )
 
@@ -476,9 +536,10 @@ def main():
     )  # Smaller batch for GPT
 
     model.train()
-    criterion = nn.CrossEntropyLoss(ignore_index=model.tokenizer.pad_token_id)
+    # criterion = nn.CrossEntropyLoss(ignore_index=model.tokenizer.pad_token_id)
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
-    for epoch in range(EPOCHS):
+    for epoch in range(EPOCHS_PHASE_1):
         total_loss = 0
         pbar = tqdm(train_loader, desc=f"Caption Epoch {epoch+1}")
 
@@ -486,53 +547,156 @@ def main():
             batch = batch.to(DEVICE)
             captions = batch.description  # Ensure this exists in your dataset class
 
-            # Tokenize
+            # 1. Tokenize text
             inputs = model.tokenizer(
                 captions,
                 padding=True,
                 truncation=True,
-                max_length=100,
+                max_length=128,
                 return_tensors="pt",
             ).to(DEVICE)
 
-            optimizer.zero_grad()
+            input_ids = inputs.input_ids
+            attention_mask = inputs.attention_mask
+            batch_size = input_ids.size(0)
 
-            # Forward
+            # 1. Forward pass (returns logits for [Graph_Tokens + Text_Tokens])
             logits = model(batch, inputs.input_ids, inputs.attention_mask)
 
-            # Shift for Causal Loss
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = inputs.input_ids[..., 1:].contiguous()  # Skip first token
+            # 2. Create the target labels tensor
+            # Initialize everything to -100 (which the criterion will now ignore)
+            labels = torch.full(logits.shape[:2], -100, dtype=torch.long, device=DEVICE)
 
-            # Note: The shapes might need slight adjustment depending on
-            # if you included the graph token in logits.
-            # Usually: logits has length L+1 (Graph + Text).
-            # Labels has length L.
-            # So logits[:, :-1, :] predicts logits[:, 1:, :] which should align with text.
+            # 3. Fill the text portion
+            # Logic: We want the logit at index 'i' to predict the token at 'i+1'
+            # The text starts at index 'num_graph_tokens' (e.g., 8)
+            num_g = model.num_graph_tokens
+            labels[:, num_g : -1] = inputs.input_ids[:, 1:]
 
-            # Simplified alignment:
-            # Logits [Batch, Seq+1, Vocab]
-            # We want Logits[Graph] -> Label[Word1]
-            # We want Logits[Word1] -> Label[Word2]
-            shift_logits = logits[:, :-1, :]  # Remove last prediction
-            shift_labels = inputs.input_ids  # Target is the text itself
+            # 4. CRITICAL: Also mask the tokenizer's own padding tokens
+            # If the original input was a pad token, we shouldn't calculate loss for it
+            # Note: we shift the mask to match the shifted labels
+            text_mask = inputs.attention_mask[:, 1:]
+            labels[:, num_g : -1][text_mask == 0] = -100
 
+            # 5. Shift Logits and Labels for Causal LM
+            # Remove the very last logit (nothing to predict) and 
+            # the very first label (the graph token itself doesn't have a 'previous' word to predict it)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            # 6. Compute Loss
             loss = criterion(
-                shift_logits.reshape(-1, shift_logits.size(-1)),
-                shift_labels.reshape(-1),
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
             )
-
+            # Debugging check
+            valid_mask = (shift_labels != -100)
+            if valid_mask.any():
+                max_label = shift_labels[valid_mask].max().item()
+                min_label = shift_labels[valid_mask].min().item()
+                vocab_size = model.gpt2.config.vocab_size
+                
+                if max_label >= vocab_size or min_label < 0:
+                    print(f"CRITICAL ERROR: Label {max_label} is out of bounds for vocab size {vocab_size}")
             loss.backward()
-            optimizer.step()
+            optimizer_phase1.step()
+            optimizer_phase1.zero_grad()
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
         print(
-            f"Epoch {epoch+1}/{EPOCHS} - Average Loss: {total_loss / len(train_loader):.4f}"
+            f"Phase 1, Epoch {epoch+1}/{EPOCHS_PHASE_1} - Average Loss: {total_loss / len(train_loader):.4f}"
         )
         # Save Checkpoint
-        torch.save(model.state_dict(), f"checkpoints/g2cap_epoch_{epoch+10}.pt")
+        # torch.save(model.state_dict(), f"checkpoints/g2cap_epoch_{epoch+10}.pt")
+
+    for param in model.gpt2.parameters():
+        param.requires_grad = True
+
+    optimizer_phase2 = torch.optim.AdamW(
+        [
+            {"params": model.encoder.parameters(), "lr": 5e-5},
+            {"params": model.projector.parameters(), "lr": 1e-4},
+            {"params": model.gpt2.parameters(), "lr": 1e-5},  # Extremely low LR
+        ]
+    )
+
+    for epoch in range(EPOCHS_PHASE_2):
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Caption Epoch {epoch+1}")
+
+        for batch in pbar:
+            batch = batch.to(DEVICE)
+            captions = batch.description  # Ensure this exists in your dataset class
+
+            # 1. Tokenize text
+            inputs = model.tokenizer(
+                captions,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt",
+            ).to(DEVICE)
+
+            input_ids = inputs.input_ids
+            attention_mask = inputs.attention_mask
+            batch_size = input_ids.size(0)
+
+            # 1. Forward pass (returns logits for [Graph_Tokens + Text_Tokens])
+            logits = model(batch, inputs.input_ids, inputs.attention_mask)
+
+            # 2. Create the target labels tensor
+            # Initialize everything to -100 (which the criterion will now ignore)
+            labels = torch.full(logits.shape[:2], -100, dtype=torch.long, device=DEVICE)
+
+            # 3. Fill the text portion
+            # Logic: We want the logit at index 'i' to predict the token at 'i+1'
+            # The text starts at index 'num_graph_tokens' (e.g., 8)
+            num_g = model.num_graph_tokens
+            labels[:, num_g : -1] = inputs.input_ids[:, 1:]
+
+            # 4. CRITICAL: Also mask the tokenizer's own padding tokens
+            # If the original input was a pad token, we shouldn't calculate loss for it
+            # Note: we shift the mask to match the shifted labels
+            text_mask = inputs.attention_mask[:, 1:]
+            labels[:, num_g : -1][text_mask == 0] = -100
+
+            # 5. Shift Logits and Labels for Causal LM
+            # Remove the very last logit (nothing to predict) and 
+            # the very first label (the graph token itself doesn't have a 'previous' word to predict it)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            # 6. Compute Loss
+            loss = criterion(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
+            )
+            # Debugging check
+            valid_mask = (shift_labels != -100)
+            if valid_mask.any():
+                max_label = shift_labels[valid_mask].max().item()
+                min_label = shift_labels[valid_mask].min().item()
+                vocab_size = model.gpt2.config.vocab_size
+                
+                if max_label >= vocab_size or min_label < 0:
+                    print(f"CRITICAL ERROR: Label {max_label} is out of bounds for vocab size {vocab_size}")
+            loss.backward()
+            optimizer_phase2.step()
+            optimizer_phase2.zero_grad()
+            total_loss += loss.item()
+            pbar.set_postfix(loss=loss.item())
+
+        print(
+            f"Phase 2, Epoch {epoch+1}/{EPOCHS_PHASE_2} - Average Loss: {total_loss / len(train_loader):.4f}"
+        )
+        # Save Checkpoint
+        torch.save(
+            model.state_dict(), f"checkpoints/g2cap_epoch_{epoch+EPOCHS_PHASE_1}.pt"
+        )
 
 
 if __name__ == "__main__":
     main()
+    # pretrain()

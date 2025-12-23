@@ -45,7 +45,7 @@ with torch.no_grad():
         # A. Generate Caption
         # Uses the generate_caption method defined in the previous step
         # You can adjust max_length based on your validation set statistics
-        generated_text = model.generate_caption(data, max_length=100)
+        generated_text = model.generate_caption(data, max_length=150)
 
         # B. Store Result
         # The document requires aligning graphs using data.id [cite: 39]
