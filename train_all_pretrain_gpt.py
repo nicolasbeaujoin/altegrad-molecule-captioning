@@ -169,7 +169,7 @@ def train(hidden_dim, train_graphs, epochs_phase1, epochs_phase2, device):
     # Ensure your PreprocessedGraphDataset loads data.description!
     train_ds_cap = PreprocessedGraphDataset(train_graphs, None)
     train_loader = DataLoader(
-        train_ds_cap, batch_size=16, shuffle=True
+        train_ds_cap, batch_size=64, shuffle=True
     )  # Smaller batch for GPT
 
     model.train()

@@ -24,7 +24,7 @@ model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2-medium
 model.tokenizer.pad_token = model.tokenizer.eos_token
 
 # Load trained weights (state_dict) and move to device
-state_dict2 = torch.load("checkpoints/g2cap_epoch_2.pt", map_location=device)
+state_dict2 = torch.load("checkpoints/g2cap_epoch_8.pt", map_location=device)
 model.load_state_dict(state_dict2)
 model.to(device)
 model.eval()  # Set to evaluation mode (turns off dropout, etc.)
@@ -39,7 +39,7 @@ predictions = []
 # 3. Inference Loop
 print("Generating captions for test set...")
 with torch.no_grad():
-    for data in tqdm(test_loader):
+    for data in tqdm(test_loader)[:5]:
         data = data.to(device)
 
         # A. Generate Caption

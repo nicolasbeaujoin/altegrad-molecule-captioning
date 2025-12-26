@@ -372,34 +372,34 @@ class Graph2CaptionV2(nn.Module):
         ).logits
 
     def generate_caption(self, data, max_length=100):
-        """
-        Updated inference logic to handle multiple graph tokens. [cite: 83, 84]
-        """
         self.eval()
         with torch.no_grad():
-            # 1. Encode Graph to tokens
+            # 1. Encode Graph to tokens [Batch, 8, 1024]
             node_features = self.encoder.forward_features(data)
-            graph_tokens = self.projector(node_features, data.batch)  # [1, 8, 1024]
+            graph_tokens = self.projector(node_features, data.batch)
 
-            # 2. Initialize generation
-            cur_input_embeds = graph_tokens
-            generated_ids = []
+            # 2. Create the Attention Mask manually
+            # Since we are doing inference molecule-by-molecule (Batch Size 1),
+            # we create a mask of 1s for the 8 graph tokens.
+            batch_size = graph_tokens.shape[0]
+            num_tokens = graph_tokens.shape[1]  # This is 8
+            attention_mask = torch.ones(
+                (batch_size, num_tokens), device=graph_tokens.device
+            )
 
-            # Simple greedy loop (Batch Size 1 recommended for inference)
-            for _ in range(max_length):
-                outputs = self.gpt2(inputs_embeds=cur_input_embeds)
-                next_token_logits = outputs.logits[:, -1, :]
-                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+            # 3. Generate using the mask
+            output_ids = self.gpt2.generate(
+                inputs_embeds=graph_tokens,
+                attention_mask=attention_mask,  # <--- PASS THE MASK HERE
+                max_new_tokens=max_length,
+                do_sample=True,
+                top_p=0.92,
+                top_k=50,
+                temperature=0.8,
+                no_repeat_ngram_size=3,
+                repetition_penalty=2.0,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
 
-                generated_ids.append(next_token_id.item())
-
-                if next_token_id.item() == self.tokenizer.eos_token_id:
-                    break
-
-                # Append predicted token embedding to current sequence
-                next_input_embeds = self.gpt2.transformer.wte(next_token_id)
-                cur_input_embeds = torch.cat(
-                    (cur_input_embeds, next_input_embeds), dim=1
-                )
-
-            return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
