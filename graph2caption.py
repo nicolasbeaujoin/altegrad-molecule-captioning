@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GINEConv, global_add_pool
+from torch_geometric.nn import GINEConv, global_add_pool, to_dense_batch
+import torch.nn.functional as F
+from torch_geometric.nn import MessagePassing
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 
