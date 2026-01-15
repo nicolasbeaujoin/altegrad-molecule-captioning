@@ -65,40 +65,17 @@ This generates `test_retrieved_descriptions.csv` with retrieved descriptions for
 - `test_retrieved_descriptions.csv`: Retrieved descriptions for test set
 
 
-## Logic of the new model and training proposed here
+## Method of the section "Improved retrieval method" from the report.
 
-1. Model Architecture: The "Visual Prompt" Logic
-The model treats the molecular graph not as a string (SMILES), but as a set of visual features that "prompt" a Large Language Model (LLM).
+The file retrieval_method.py basically contains everything used in this method.
 
-Encoder (MolGNN): * Input: 9 node features (atomic num, chirality, etc.) and 3 edge features (bond type, stereo, etc.).
-- Structure: 6-layer GINEConv with Residual Connections and a Hidden Dimension of 256.
-- Output: A dense feature map of every atom in the molecule.
+- The function pyg_to_rdkit reconstructs an RDKit Molecule object from the molecule graphs that we have in the datasets.
 
-Bridge (MultiTokenProjector):
-- Mechanism: Uses 8 learnable latent queries and Cross-Attention to "scan" the graph features.
-- Goal: Instead of shrinking the molecule into one vector, it creates 8 "Graph Tokens" that represent different structural motifs (rings, functional groups).
+- The MolGNN class contains the architecture of the graph encoder, which is explained in the report.
 
-Decoder (GPT-2 Medium):
-- Mechanism: Receives a sequence: [8 Graph Tokens] + [Text Tokens].
-- Generation: It uses the graph tokens as context to predict the next word in the description.
+- The ContrastiveModel class contains the whole model (graph encoder and pre-trained text encoder) with a forward method that 
+outputs a graph embedding and a text embedding for a given molecule.
 
-2. Phase 0: Pre-training (Masked Atom Modeling)
-Before looking at text, the GNN must understand chemistry.
+- The functions train_contrastive and validate_contrastive are used to respectively perform training and validation of a ContrastiveModel.
 
-- The Task: We hide (mask) 15% of the atoms in a molecule and ask the GNN to predict what they were based on their neighbors.
-- Logic: This forces the GNN to learn "chemical grammar"—for example, that an Oxygen atom is likely to be near a Carbon in a carboxyl group.
-- Result: A "warm" encoder that already understands molecular topology.
-
-3. Phase 1: Alignment (Freezing GPT-2)
-Connecting a new GNN to a pre-trained LLM is difficult because the initial GNN outputs are "gibberish" to GPT-2.
-
-- Setup: Freeze all GPT-2 weights. Only train the MolGNN and the Projector.
-- Logic: We keep the "brain" (GPT-2) fixed and force the "eyes" (GNN) to adapt its output until the vectors fall into a range that GPT-2 recognizes as meaningful semantic concepts.
-- Goal: Prevent the random initial gradients from the GNN from destroying GPT-2's pre-trained English language knowledge.
-
-4. Phase 2: Joint Fine-tuning (Unfreezing)
-Once the modalities are aligned, we refine the entire system.
-
-- Setup: Unfreeze everything.
-- Learning Rates: This is the most critical part: GNN/Projector: moderate lr, GPT-2: very low lr.
-- Logic: We allow GPT-2 to slightly adjust its vocabulary and internal logic to better suit the specific domain of "Chemical English," while the GNN continues to sharpen its feature extraction.
+- The run_retrieval_pipeline function is used to make the retrieval of the captions of the molecules in the test set.

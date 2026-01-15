@@ -22,10 +22,10 @@ TEST_GRAPHS = "data/test_graphs.pkl"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 HIDDEN_DIM = 256
 GNN_LAYERS = 6
-BATCH_SIZE = 32  # Keep small for Onyxia memory
+BATCH_SIZE = 32
 LR = 5e-4
 EPOCHS = 5
-TEMP = 0.07  # Temperature for InfoNCE loss
+TEMP = 0.07
 
 
 def pyg_to_rdkit(data):
@@ -126,14 +126,7 @@ class ContrastiveModel(nn.Module):
         super().__init__()
         self.gnn = gnn
         # SciBERT for high-quality chemical text embeddings
-        # self.text_encoder = AutoModel.from_pretrained(
-        #     "allenai/scibert_scivocab_uncased"
-        # )
-        # self.tokenizer = AutoTokenizer.from_pretrained(
-        #     "allenai/scibert_scivocab_uncased"
-        # )
-        # Load Galactica
-        model_name = "facebook/galactica-1.3b"
+        model_name = "allenai/scibert_scivocab_uncased"
         self.text_encoder = AutoModel.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -148,7 +141,7 @@ class ContrastiveModel(nn.Module):
 
         # Upgraded Projection Head (MLP is better than linear)
         self.text_proj = nn.Sequential(
-            nn.Linear(2048, 512),  # Galactica-1.3b hidden size is 2048
+            nn.Linear(768, 512),
             nn.ReLU(),
             nn.Linear(512, HIDDEN_DIM),
         )
@@ -200,6 +193,28 @@ def train_contrastive(model, loader, optimizer):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+# --- 4.5. VALIDATION FUNCTION ---
+def validate_contrastive(model, loader):
+    """Evaluate the model on validation set without updating gradients."""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for data in tqdm(loader, desc="Validating"):
+            data = data.to(DEVICE)
+            g_emb, t_emb = model(data, data.description)
+
+            # InfoNCE Loss (same as training)
+            g_emb = F.normalize(g_emb, dim=-1)
+            t_emb = F.normalize(t_emb, dim=-1)
+
+            logits = torch.matmul(g_emb, t_emb.T) / TEMP
+            labels = torch.arange(g_emb.size(0)).to(DEVICE)
+
+            loss = F.cross_entropy(logits, labels)
+            total_loss += loss.item()
     return total_loss / len(loader)
 
 
@@ -288,15 +303,17 @@ print("Starting Training...")
 
 for epoch in range(EPOCHS):
     print(f"--- Epoch {epoch+1}/{EPOCHS} ---")
-    loss = train_contrastive(model, loader_train, optimizer)
-    val_loss = train_contrastive(model, loader_val, optimizer)
+    train_loss = train_contrastive(model, loader_train, optimizer)
+    val_loss = validate_contrastive(model, loader_val)
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        best_model = model.state_dict()
+        best_model = model.state_dict().copy()
         best_epoch = epoch
 
-    print(f"Epoch {epoch}: {loss}")
-    print(f"Validation Loss: {val_loss} (Best: {best_val_loss} at Epoch {best_epoch})")
+    print(f"Train Loss: {train_loss:.4f}")
+    print(
+        f"Validation Loss: {val_loss:.4f} (Best: {best_val_loss:.4f} at Epoch {best_epoch+1})"
+    )
 
 # save model
 torch.save(best_model, "contrastive_model_last.pth")
