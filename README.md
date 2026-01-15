@@ -2,7 +2,7 @@
 
 By Vadim Lagresle, Nicolas Beaujoin, Justin Bec.
 
-This repository implements several methods to perform molecule captioning, either by retrieval or by generation.
+This repository contains several methods to perform molecule captioning, either by retrieval or by generation.
 
 ## Installation
 
