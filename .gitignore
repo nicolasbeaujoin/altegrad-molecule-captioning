@@ -28,3 +28,5 @@ __pycache__/
 remote.ipynb
 
 train_all_pretrain.py
+
+latex.tex

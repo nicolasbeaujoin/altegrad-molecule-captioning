@@ -13,9 +13,10 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 from data_utils import PreprocessedGraphDataset
 from rdkit.Chem import rdFingerprintGenerator
+import matplotlib.pyplot as plt
 
 
-# --- 1. CONFIGURATION ---
+# configuration
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 VAL_GRAPHS = "data/validation_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
@@ -57,32 +58,24 @@ def pyg_to_rdkit(data):
 
     final_mol = mol.GetMol()
 
-    # --- CRITICAL FIX: Initialize Rings and Valences ---
     try:
-        # 1. Force valence calculation (handles the N, 4 warning better)
         final_mol.UpdatePropertyCache(strict=False)
-
-        # 2. Initialize the RingInfo (This fixes the RingInfo not initialized error)
         Chem.FastFindRings(final_mol)
-
-        # 3. Basic sanitization (skipping KEKULIZE to avoid valence errors in exotic rings)
         Chem.SanitizeMol(
             final_mol,
             Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE,
         )
     except:
-        # Fallback for very "broken" molecules
         final_mol.UpdatePropertyCache(strict=False)
         Chem.FastFindRings(final_mol)
 
     return final_mol
 
 
-# --- 2. GNN ENCODER (Upgraded 256-dim) ---
+# GNN encoder
 class MolGNN(nn.Module):
     def __init__(self, hidden=256, layers=6):
         super().__init__()
-        # 9 node and 3 edge features as per challenge docs
         self.node_embeds = nn.ModuleList(
             [nn.Embedding(sz, hidden) for sz in [119, 9, 11, 12, 9, 5, 8, 2, 2]]
         )
@@ -100,7 +93,7 @@ class MolGNN(nn.Module):
             self.bns.append(nn.BatchNorm1d(hidden))
 
     def forward(self, data):
-        # Embed features
+        # embed features
         x = sum(
             [self.node_embeds[i](data.x[:, i]) for i in range(len(self.node_embeds))]
         )
@@ -111,16 +104,16 @@ class MolGNN(nn.Module):
             ]
         )
 
-        # Message Passing
+        # message Passing
         for conv, bn in zip(self.convs, self.bns):
             h_in = x
             x = F.relu(bn(conv(x, data.edge_index, edge_attr)))
-            x = x + h_in  # Residual
+            x = x + h_in  # residual
 
         return global_add_pool(x, data.batch)
 
 
-# --- 3. CONTRASTIVE MODEL ---
+# main model
 class ContrastiveModel(nn.Module):
     def __init__(self, gnn):
         super().__init__()
@@ -130,16 +123,14 @@ class ContrastiveModel(nn.Module):
         self.text_encoder = AutoModel.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # FIX: Explicitly set pad token and padding side
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
 
-        # FREEZE Galactica to save memory and avoid "Asking to pad" errors in backprop
         for param in self.text_encoder.parameters():
             param.requires_grad = False
 
-        # Upgraded Projection Head (MLP is better than linear)
+        # projection head
         self.text_proj = nn.Sequential(
             nn.Linear(768, 512),
             nn.ReLU(),
@@ -147,18 +138,15 @@ class ContrastiveModel(nn.Module):
         )
 
     def forward(self, data, captions):
-        # Graph branch
+        # graph embedding
         g_emb = self.gnn(data)
 
-        # Text branch (Frozen for faster alignment)
         inputs = self.tokenizer(
             captions, padding=True, truncation=True, max_length=512, return_tensors="pt"
         ).to(DEVICE)
 
         with torch.no_grad():
             outputs = self.text_encoder(**inputs)
-            # Use the mean of hidden states or the last token
-            # For retrieval, Mean Pooling is often more stable than Last Token
             mask = (
                 inputs.attention_mask.unsqueeze(-1)
                 .expand(outputs.last_hidden_state.size())
@@ -167,12 +155,13 @@ class ContrastiveModel(nn.Module):
             sum_embeddings = torch.sum(outputs.last_hidden_state * mask, 1)
             mean_pooled = sum_embeddings / torch.clamp(mask.sum(1), min=1e-9)
 
+        # text embedding
         t_emb = self.text_proj(mean_pooled)
 
         return g_emb, t_emb
 
 
-# --- 4. TRAINING FUNCTION (INFONCE) ---
+# training function
 def train_contrastive(model, loader, optimizer):
     model.train()
     total_loss = 0
@@ -180,7 +169,6 @@ def train_contrastive(model, loader, optimizer):
         data = data.to(DEVICE)
         g_emb, t_emb = model(data, data.description)
 
-        # InfoNCE Loss
         g_emb = F.normalize(g_emb, dim=-1)
         t_emb = F.normalize(t_emb, dim=-1)
 
@@ -196,7 +184,7 @@ def train_contrastive(model, loader, optimizer):
     return total_loss / len(loader)
 
 
-# --- 4.5. VALIDATION FUNCTION ---
+# validation
 def validate_contrastive(model, loader):
     """Evaluate the model on validation set without updating gradients."""
     model.eval()
@@ -206,7 +194,6 @@ def validate_contrastive(model, loader):
             data = data.to(DEVICE)
             g_emb, t_emb = model(data, data.description)
 
-            # InfoNCE Loss (same as training)
             g_emb = F.normalize(g_emb, dim=-1)
             t_emb = F.normalize(t_emb, dim=-1)
 
@@ -218,39 +205,33 @@ def validate_contrastive(model, loader):
     return total_loss / len(loader)
 
 
-# --- 5. HYBRID RETRIEVAL & TANIMOTO RERANKING ---
-
-
+# retrieval pipeline
 def run_retrieval_pipeline(model, train_loader, test_loader):
     model.eval()
     train_embs, train_caps, train_fps = [], [], []
 
-    # A. Indexing Training Set
     print("Indexing Training Set...")
     for data in tqdm(train_loader):
         data = data.to(DEVICE)
         with torch.no_grad():
-            # Learned GNN features
+            # learned GNN features
             g_emb = F.normalize(model.gnn(data), dim=-1).cpu().numpy()
             train_embs.append(g_emb)
             train_caps.extend(data.description)
-            # Expert Fingerprints
+            # fingerprints
             for i in range(data.num_graphs):
                 try:
                     mol = pyg_to_rdkit(data[i])
-                    # Modern generator call
                     fp = gen.GetFingerprint(mol)
                 except:
-                    # CRITICAL: Fallback must be an ExplicitBitVect of the same size
-                    fp = gen.GetFingerprint(Chem.MolFromSmiles(""))  # Empty molecule FP
+                    fp = gen.GetFingerprint(Chem.MolFromSmiles(""))  # empty molecule FP
 
                 train_fps.append(fp)
 
     train_embs = np.vstack(train_embs).astype("float32")
-    index = faiss.IndexFlatIP(HIDDEN_DIM)  # Inner product for cosine similarity
+    index = faiss.IndexFlatIP(HIDDEN_DIM)  # inner product for cosine similarity
     index.add(train_embs)
 
-    # B. Test Set Retrieval
     print("Retrieving Test Set...")
     results = []
     for data in tqdm(test_loader):
@@ -258,7 +239,7 @@ def run_retrieval_pipeline(model, train_loader, test_loader):
         with torch.no_grad():
             q_emb = F.normalize(model.gnn(data), dim=-1).cpu().numpy()
 
-        # Coarse search: Top 50 candidates
+        # top 50 candidates
         _, indices = index.search(q_emb, 50)
 
         for i in range(len(data.id)):
@@ -268,10 +249,8 @@ def run_retrieval_pipeline(model, train_loader, test_loader):
             except:
                 test_fp = gen.GetFingerprint(Chem.MolFromSmiles(""))
 
-            # Now both are guaranteed to be ExplicitBitVect
             best_sim, best_idx = -1.0, -1
             for neighbor_idx in indices[i]:
-                # This will now work without ArgumentError
                 sim = DataStructs.TanimotoSimilarity(test_fp, train_fps[neighbor_idx])
                 if sim > best_sim:
                     best_sim, best_idx = sim, neighbor_idx
@@ -280,7 +259,6 @@ def run_retrieval_pipeline(model, train_loader, test_loader):
     return pd.DataFrame(results)
 
 
-# --- EXECUTION ---
 # train set
 dataset_train = PreprocessedGraphDataset(TRAIN_GRAPHS)
 loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True)
@@ -299,12 +277,16 @@ loader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=False)
 best_model = None
 best_val_loss = float("inf")
 best_epoch = -1
+train_history = []
+val_history = []
 print("Starting Training...")
 
 for epoch in range(EPOCHS):
     print(f"--- Epoch {epoch+1}/{EPOCHS} ---")
     train_loss = train_contrastive(model, loader_train, optimizer)
     val_loss = validate_contrastive(model, loader_val)
+    train_history.append(train_loss)
+    val_history.append(val_loss)
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         best_model = model.state_dict().copy()
@@ -314,6 +296,19 @@ for epoch in range(EPOCHS):
     print(
         f"Validation Loss: {val_loss:.4f} (Best: {best_val_loss:.4f} at Epoch {best_epoch+1})"
     )
+
+# plot training and validation loss curves
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, EPOCHS + 1), train_history, label="Train Loss", marker="o")
+plt.plot(range(1, EPOCHS + 1), val_history, label="Validation Loss", marker="s")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training and Validation Loss Curves")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("loss_curves.png", dpi=300, bbox_inches="tight")
+plt.close()
 
 # save model
 torch.save(best_model, "contrastive_model_last.pth")
