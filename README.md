@@ -1,6 +1,8 @@
-# Molecule-Text Retrieval
+# ALTeGraD 25-26: Molecular Graph Captioning
 
-Graph neural network for molecular graph and text description retrieval.
+By Vadim Lagresle, Nicolas Beaujoin, Justin Bec.
+
+This repository implements several methods to perform molecule captioning, either by retrieval or by generation.
 
 ## Installation
 
@@ -94,3 +96,26 @@ outputs a graph embedding and a text embedding for a given molecule.
 - The functions train_contrastive and validate_contrastive are used to respectively perform training and validation of a ContrastiveModel.
 
 - The run_retrieval_pipeline function is used to make the retrieval of the captions of the molecules in the test set.
+
+
+## IV. Tri-Modal Retrieval-Augmented Generation Architecture
+
+The script RAG.py implements our final architecture, bridging graph representation learning with retrieval-augmented generation (RAG) to produce chemically accurate captions. The pipeline consists of the following components:
+
+1.⁠ ⁠Data Processing & Retrieval
+
+- pyg_to_rdkit & compute_fingerprint: Utility functions that reconstruct RDKit molecule objects from PyTorch Geometric graphs and calculate Morgan Fingerprints (2048 bits).
+
+- build_neighbor_map: Implements the retrieval engine. It computes Tanimoto similarity across the dataset to identify the nearest structural neighbor for every molecule. The description of this neighbor is extracted to serve as a "context prompt."
+
+- RAGDataset: A custom dataset class that bundles the three required inputs for the model: the molecular graph, the SMILES string, and the retrieved neighbor's description.
+
+2.⁠ ⁠Neural Architecture
+
+- HybridMolGINE: The visual encoder. It replaces standard GCNs with GINE (Graph Isomorphism Network) layers to explicitly aggregate edge features (bond types) with node features, capturing precise chemical topology. It fuses these graph features with global fingerprint embeddings.
+
+- RAGMolT5: The core multi-modal model. It uses a frozen MolT5 Encoder to process the textual prompt and fuses it with the GINE output. This combined representation is passed to a trainable MolT5 Decoder to generate the final caption.
+
+3.⁠ ⁠Training Loop
+
+- train_loop: Manages the optimization process using Cross-Entropy Loss. It includes Gradient Clipping (to stabilize the Transformer) and a Learning Rate Scheduler (ReduceLROnPlateau).
