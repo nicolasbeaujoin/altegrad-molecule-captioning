@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_add_pool, MessagePassing
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from tqdm import tqdm 
+from tqdm import tqdm
 
 from data_utils import load_id2emb, PreprocessedGraphDataset
 
@@ -35,6 +35,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # =========================================================
 # MODEL: Encoder (GINE)
 # =========================================================
+
 
 class GINEConv(MessagePassing):
     def __init__(self, emb_dim, eps=0.0, train_eps=True):
@@ -142,22 +143,23 @@ class MolGNN(nn.Module):
 # MODEL: Decoder (GPT-2 Bridge)
 # =========================================================
 
+
 class Graph2CaptionV2(nn.Module):
     def __init__(self, pretrained_encoder, gpt2_model_name="gpt2"):
         super().__init__()
         self.encoder = pretrained_encoder
         gnn_hidden_dim = 128
-        
+
         self.gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_name)
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_model_name)
-        gpt_emb_size = self.gpt2.config.n_embd 
+        gpt_emb_size = self.gpt2.config.n_embd
 
         self.projection = nn.Linear(gnn_hidden_dim, gpt_emb_size)
 
     def forward(self, data, text_input_ids, text_attention_mask):
-        graph_vec = self.encoder.forward_features(data)  
-        projected_emb = self.projection(graph_vec).unsqueeze(1) 
-        
+        graph_vec = self.encoder.forward_features(data)
+        projected_emb = self.projection(graph_vec).unsqueeze(1)
+
         text_embeds = self.gpt2.transformer.wte(text_input_ids)
         inputs_embeds = torch.cat((projected_emb, text_embeds), dim=1)
 
@@ -180,13 +182,15 @@ class Graph2CaptionV2(nn.Module):
                 outputs = self.gpt2(inputs_embeds=cur_input_embeds)
                 next_token_logits = outputs.logits[:, -1, :]
                 next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-                
+
                 generated_ids.append(next_token_id)
                 if next_token_id.item() == self.tokenizer.eos_token_id:
                     break
-                
+
                 next_input_embeds = self.gpt2.transformer.wte(next_token_id)
-                cur_input_embeds = torch.cat((cur_input_embeds, next_input_embeds), dim=1)
+                cur_input_embeds = torch.cat(
+                    (cur_input_embeds, next_input_embeds), dim=1
+                )
 
         return self.tokenizer.decode(
             [t.item() for t in generated_ids], skip_special_tokens=True
@@ -196,6 +200,7 @@ class Graph2CaptionV2(nn.Module):
 # =========================================================
 # Pre-Training Functions
 # =========================================================
+
 
 def mask_atoms_for_pretraining(batch):
     num_nodes = batch.x.size(0)
@@ -215,6 +220,7 @@ def mask_atoms_for_pretraining(batch):
     batch_masked.y_true = y_true
     return batch_masked
 
+
 def train_epoch_pretrain(mol_enc, loader, optimizer, device):
     mol_enc.train()
     total_loss, total = 0.0, 0
@@ -224,7 +230,7 @@ def train_epoch_pretrain(mol_enc, loader, optimizer, device):
         graphs = graphs.to(device)
         batch_masked = mask_atoms_for_pretraining(graphs)
         logits = mol_enc.forward_pretrain(batch_masked)
-        
+
         masked_logits = logits[batch_masked.mask]
         y_true = batch_masked.y_true
 
@@ -233,16 +239,17 @@ def train_epoch_pretrain(mol_enc, loader, optimizer, device):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             bs = graphs.num_graphs
             total_loss += loss.item() * bs
             total += bs
 
     return total_loss / total if total > 0 else 0.0
 
+
 @torch.no_grad()
 def eval_epoch_pretrain(mol_enc, loader, device):
-    mol_enc.eval() 
+    mol_enc.eval()
     total_loss, total = 0.0, 0
     criterion = nn.CrossEntropyLoss()
 
@@ -258,74 +265,83 @@ def eval_epoch_pretrain(mol_enc, loader, device):
 
         if y_true.numel() > 0:
             loss = criterion(masked_logits, y_true)
-            
+
             bs = graphs.num_graphs
             total_loss += loss.item() * bs
             total += bs
 
     return total_loss / total if total > 0 else 0.0
 
+
 # =========================================================
 # Main Pipeline
 # =========================================================
 
+
 def main():
     os.makedirs("checkpoints", exist_ok=True)
-    
-# # --- Phase 1: Pre-Training (Masking) ---
-#     print("\n=== Phase 1: Pre-Training GNN ===")
 
-#     mol_enc = MolGNN(hidden=128).to(DEVICE)
-    
-#     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, None)
-#     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    
-#     val_ds = PreprocessedGraphDataset(VAL_GRAPHS, None) 
-#     val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    
-#     pretrain_optimizer = torch.optim.Adam(mol_enc.parameters(), lr=PRETRAIN_LR)
+    # --- Phase 1: Pre-Training (Masking) ---
+    print("\n=== Phase 1: Pre-Training GNN ===")
 
-#     best_val_loss = float('inf')
+    mol_enc = MolGNN(hidden=128).to(DEVICE)
 
-#     for ep in range(PRETRAIN_EPOCHS):
-#         train_loss = train_epoch_pretrain(mol_enc, train_dl, pretrain_optimizer, DEVICE)
-        
-#         val_loss = eval_epoch_pretrain(mol_enc, val_dl, DEVICE)
-        
-#         print(f"Pretrain Epoch {ep+1}/{PRETRAIN_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, None)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 
-#         if val_loss < best_val_loss:
-#             best_val_loss = val_loss
-#             torch.save(mol_enc.state_dict(), "checkpoints/mol_enc_pretrained_best.pt")
-#             print(f"  -> New best model saved (Val Loss: {val_loss:.4f})")
+    val_ds = PreprocessedGraphDataset(VAL_GRAPHS, None)
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-#     print("\nPre-training complete.")
-#     print(f"Best Val Loss achieved: {best_val_loss:.4f}")
-    
-#     print("Loading best pre-trained weights for Phase 2...")
-#     mol_enc.load_state_dict(torch.load("checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE))
-    
+    pretrain_optimizer = torch.optim.Adam(mol_enc.parameters(), lr=PRETRAIN_LR)
+
+    best_val_loss = float("inf")
+
+    for ep in range(PRETRAIN_EPOCHS):
+        train_loss = train_epoch_pretrain(mol_enc, train_dl, pretrain_optimizer, DEVICE)
+
+        val_loss = eval_epoch_pretrain(mol_enc, val_dl, DEVICE)
+
+        print(
+            f"Pretrain Epoch {ep+1}/{PRETRAIN_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(mol_enc.state_dict(), "checkpoints/mol_enc_pretrained_best.pt")
+            print(f"  -> New best model saved (Val Loss: {val_loss:.4f})")
+
+    print("\nPre-training complete.")
+    print(f"Best Val Loss achieved: {best_val_loss:.4f}")
+
+    print("Loading best pre-trained weights for Phase 2...")
+    mol_enc.load_state_dict(
+        torch.load("checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE)
+    )
 
     # --- Phase 2: Captioning Fine-Tuning ---
     print("\n=== Phase 2: Training Graph2Caption ===")
 
     mol_enc = MolGNN(hidden=128).to(DEVICE)
-    state_dict = torch.load("checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE)
+    state_dict = torch.load(
+        "checkpoints/mol_enc_pretrained_best.pt", map_location=DEVICE
+    )
     mol_enc.load_state_dict(state_dict)
-    
+
     model = Graph2CaptionV2(pretrained_encoder=mol_enc, gpt2_model_name="gpt2")
     model.to(DEVICE)
     model.tokenizer.pad_token = model.tokenizer.eos_token
 
-    optimizer = torch.optim.AdamW([
-        {"params": model.encoder.parameters(), "lr": ENCODER_LR},     
-        {"params": model.projection.parameters(), "lr": PROJECTION_LR},   
-        {"params": model.gpt2.parameters(), "lr": GPT_LR},        
-    ])
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.encoder.parameters(), "lr": ENCODER_LR},
+            {"params": model.projection.parameters(), "lr": PROJECTION_LR},
+            {"params": model.gpt2.parameters(), "lr": GPT_LR},
+        ]
+    )
 
     train_ds_cap = PreprocessedGraphDataset(TRAIN_GRAPHS, None)
     train_loader = DataLoader(train_ds_cap, batch_size=16, shuffle=True)
-    
+
     criterion = nn.CrossEntropyLoss(ignore_index=model.tokenizer.pad_token_id)
 
     for epoch in range(EPOCHS):
@@ -335,7 +351,7 @@ def main():
 
         for batch in pbar:
             batch = batch.to(DEVICE)
-            captions = batch.description 
+            captions = batch.description
 
             inputs = model.tokenizer(
                 captions,
@@ -350,7 +366,7 @@ def main():
             logits = model(batch, inputs.input_ids, inputs.attention_mask)
 
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = inputs.input_ids.contiguous() 
+            shift_labels = inputs.input_ids.contiguous()
 
             loss = criterion(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -363,8 +379,9 @@ def main():
             pbar.set_postfix(loss=loss.item())
 
         torch.save(model.state_dict(), f"checkpoints/g2cap_epoch_{epoch+1}.pt")
-    
+
     print("Training Complete.")
+
 
 if __name__ == "__main__":
     main()

@@ -14,3 +14,17 @@ max_length.png
 new_model.png
 submission4.csv
 
+test.py
+train_all_pretrain_gpt.py
+graph2caption.py
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# macOS system files
+.DS_Store
+
+remote.ipynb
+
+train_all_pretrain.py

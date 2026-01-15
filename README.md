@@ -15,7 +15,7 @@ Place your preprocessed graph data files in the `data/` directory:
 - `validation_graphs.pkl`
 - `test_graphs.pkl`
 
-## Usage
+## I. Usage of the baseline method
 
 Run the following scripts in order:
 
@@ -59,13 +59,28 @@ python retrieval_answer.py
 
 This generates `test_retrieved_descriptions.csv` with retrieved descriptions for each test molecule.
 
-## Output
+### 5. Output
 
 - `model_checkpoint.pt`: Trained GCN model
 - `test_retrieved_descriptions.csv`: Retrieved descriptions for test set
 
 
-## Method of the section "Improved retrieval method" from the report.
+## II. Method of the "Generative model" section of the report.
+
+The file pretrain_gpt_clean.py contains everything used in this method. 
+
+- The class MolGNN is a GINE-based graph encoder that outputs a latent representation of the graph molecule.
+
+- The Graph2CaptionV2 is the main model that contains the MolGNN graph encoder and the pre-trained GPT2 decoder that outputs the captions.
+
+- The functions mask_atoms_for_pretraining, train_epoch_pretrain and eval_epoch_pretrain are used for the self-supervised training phase.
+
+- The training of the main model is then performed in the function main().
+
+
+
+
+## III. Method of the section "Improved retrieval method" from the report.
 
 The file retrieval_method.py basically contains everything used in this method.
 
