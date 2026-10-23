@@ -1,8 +1,9 @@
 # ALTeGraD 25-26: Molecular Graph Captioning
 
-By Vadim Lagresle, Nicolas Beaujoin, Justin Bec.
+By Nicolas Beaujoin, Justin Bec, Vadim Lagresle.
 
 This repository contains several methods to perform molecule captioning, either by retrieval or by generation.
+Please check the pdf file for the problem statement and more context.
 
 ## Installation
 
